@@ -19,6 +19,7 @@
 #include <libopencm3/stm32/syscfg.h>
 #include <libopencm3/stm32/gpio.h>
 #include <libopencm3/stm32/usart.h>
+#include <libopencm3/cm3/systick.h>
 #include <libopencm3/stm32/exti.h>
 #include <libopencm3/cm3/nvic.h>
 #include <libopencm3/stm32/rcc.h>
@@ -27,6 +28,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "led.h"
+#include "delay.h"
 #include "main.h"
 #include "msc.h"
 
@@ -34,12 +37,33 @@
 #include "xprintf.h"
 #include "fatfs/ff.h"
 
+#define MENU_TEXT_LEN 20
+
 //Memory for the menu ROM and the running cartridge.
 //We keep both in memory so we can quickly exchange them when a reset has been detected.
+const int menuIndex = 0xfff; // fixed location in multicart.bin
 char menuData[8*1024];
-char cartData[64*1024];
 char *romData=menuData;
 unsigned char parmRam[256];
+
+char menuDir[_MAX_LFN + 1];
+
+typedef struct {
+	int is_dir;
+	char fname[_MAX_LFN + 1];
+} file_entry;
+
+typedef struct {
+	int num_files;
+	file_entry f_entry[80];
+} dir_listing;
+
+union cart_and_listing {
+	char cartData[64*1024];
+	dir_listing listing;
+};
+
+union cart_and_listing c_and_l;
 
 /*
 //Pinning:
@@ -71,10 +95,15 @@ void loadRom(char *fn) {
 	FRESULT fr;
 	UINT r=0;
 	int n;
-	if (romData==cartData) n=sizeof(cartData); else n=sizeof(menuData);
+	if (romData==c_and_l.cartData)
+		n=sizeof(c_and_l.cartData);
+	else
+		n=sizeof(menuData);
 	fr=f_open(&f, fn, FA_READ);
 	if (fr) {
 		xprintf("Error opening file: %d\n", fr);
+	} else {
+		xprintf("Opened file: %s\n", fn);
 	}
 	f_read(&f, romData, 64*1024, &r);
 	if (n>32*1024 && r<=32*1024) {
@@ -85,39 +114,114 @@ void loadRom(char *fn) {
 	f_close(&f);
 }
 
-//Get a listing of the roms in the 'roms/' directory and
-//poke them into the menu cartridge space
-void loadListing(void) {
-	int strpos=0x800; //enough for 512 name ptrs
-	int ptrpos=0x400;
-	int i;
-	char *name;
+int removeExtension(char* filename, char* extension) {
+	char* ptr = strstr(filename,extension);
+	if (ptr) {
+		*ptr = 0;
+		return 1;
+	}
+	return 0;
+}
+
+static int f_entry_compare(const void* a, const void* b)
+{
+	// setting up rules for comparison
+	file_entry *f_entryA = (file_entry *)a;
+	file_entry *f_entryB = (file_entry *)b;
+
+	int dirA = f_entryA->is_dir;
+	int dirB = f_entryB->is_dir;
+
+	if (dirA == dirB) {
+		return (strcmp(f_entryA->fname, f_entryB->fname));
+	} else {
+		 return dirB - dirA;
+	}
+}
+
+void sortDirectory(char *fdir) {
 	DIR d;
 	FILINFO fi;
 	char lfn[_MAX_LFN + 1];
 	fi.lfname=lfn;
 	fi.lfsize=sizeof(lfn);
-	xprintf("Reading root dir...\n");
-	f_opendir(&d, "/roms");
+
+	int idx = 0;
+	dir_listing *d_listing = &(c_and_l.listing);
+	file_entry *f_entry;
+	char *name;
+	int is_dir;
+
+	// initial unsorted directory read
+	f_opendir(&d, fdir);
 	while (f_readdir(&d, &fi)==FR_OK) {
+		// xprintf("Found file %s (%s)\n", fi.lfname, fi.fname);
+		f_entry=&(d_listing->f_entry[idx]);
+
 		if (fi.fname[0]==0) break;
-		if (fi.fname[0]=='.') continue;
-//		xprintf("Found file %s (%s)\n", fi.lfname, fi.fname);
+		if (fi.fname[0]=='.') {
+			if (fi.fname[1] != '.')
+				continue;
+			if (strcmp(fdir, "/roms") == 0)
+				continue;
+		}
+
+		is_dir = (fi.fattrib & AM_DIR) ? 1 : 0;
+		if (fi.lfname[0]=='.') continue; // ignore MacOS dotfiles
 		name=fi.lfname;
 		if (name==NULL || name[0]==0) name=fi.fname; //use short name if no long name available
+
+		f_entry->is_dir = is_dir;
+		strcpy(f_entry->fname, name);
+		idx++;
+	}
+	f_closedir(&d);
+
+	d_listing->num_files = idx;
+
+	xprintf("Found %d files in %s\n", d_listing->num_files, fdir);
+
+	// xprintf("About to sort\n");
+	qsort(d_listing->f_entry, d_listing->num_files, sizeof(file_entry), f_entry_compare);
+	// xprintf("Done sorting\n");
+}
+
+//Get a listing of the roms in the 'roms/' directory and
+//poke them into the menu cartridge space
+void loadListing(char *fdir) {
+	char buff[30];
+	char *name;
+
+	int ptrpos = menuIndex + 1;  // fixed location in multicart.bin for 512 filename pointers (from &ptrpos ~ &strpos)
+	int strpos = ptrpos + 0x200; // filename data starts here
+
+	int i;
+	int is_dir;
+	int idx;
+	file_entry *f_entry;
+
+	xprintf("Reading dir: %s...\n", fdir);
+	sortDirectory(fdir);
+	for (idx = 0; idx < c_and_l.listing.num_files; idx++) {
+		f_entry=&(c_and_l.listing.f_entry[idx]);
+
+		strncpy(buff, f_entry->fname, sizeof(buff));
+		name=buff;
+
+		is_dir=f_entry->is_dir;
+
+		//xprintf("Found file %s (%d), file %d\n", name, is_dir, idx);
 		romData[ptrpos++]=strpos>>8;
 		romData[ptrpos++]=strpos&0xff;
-		// null terminate away the .bin extension
-		char* ptr = strstr(name,".bin");
-		if (ptr) {
-			*ptr = 0;
-		} else {
-			ptr = strstr(name,".BIN");
-			if (ptr) {
-				*ptr = 0;
-			}
-		}
-		i=20;
+
+		// remove extensions
+		removeExtension(name, ".bin");
+		removeExtension(name, ".BIN");
+		removeExtension(name, ".vec");
+		removeExtension(name, ".VEC");
+
+		i = is_dir ? (MENU_TEXT_LEN-2) : MENU_TEXT_LEN;
+		if (is_dir) romData[strpos++]='<';
 		while (*name!=0 && i>0) {
 			if (*name<32) {
 				romData[strpos++]=' ';
@@ -131,12 +235,12 @@ void loadListing(void) {
 			name++;
 			i--;
 		}
+		if (is_dir) romData[strpos++]='>';
 		romData[strpos++]=0x80; //end of string
 	}
 	//finish with zero ptr
 	romData[ptrpos++]=0;
 	romData[ptrpos++]=0;
-	f_closedir(&d);
 	xprintf("Done.\n");
 }
 
@@ -160,38 +264,44 @@ void loadStreamData(int addr, int len) {
 
 //User has made a selection in the cart menu (chose the i'th item) so now we have to load
 //the cartridge.
-void doChangeRom(int i) {
-	char buff[300]="/roms/";
-	DIR d;
-	FILINFO fi;
-	char lfn[_MAX_LFN + 1];
-	menuData[0x3ff]=i; //save selection so we can go back there after reset
-	romData=cartData;
-	fi.lfname=lfn;
-	fi.lfsize=sizeof(lfn);
-	xprintf("Changing to rom no %d\n", i);
-	f_opendir(&d, "/roms");
-	while (f_readdir(&d, &fi)==FR_OK) {
-		if (fi.fname[0]==0) break;
-		if (fi.fname[0]=='.') continue;
-//		xprintf("Found file %s (%s), need to get %d more files\n", fi.lfname, fi.fname, i);
-		if (i==0) break;
-		--i;
+void doChangeRom(char* basedir, int i) {
+	char buff[300];
+
+	menuData[menuIndex]=i; //save selection so we can go back there after reset
+	xprintf("Changing to rom no %d in %s\n", i, basedir);
+	sortDirectory(basedir); // recreate file listing, as loading a cart overwrote the union
+	file_entry f = c_and_l.listing.f_entry[i];
+
+	if (f.is_dir) {
+		xprintf("Found directory: %s\n", f.fname);
+		if (strcmp(f.fname,"..") == 0) {
+			char* ptr = strrchr(menuDir,'/');
+			if (ptr != NULL) {
+				*ptr = '\0';
+			}
+		} else {
+			xsprintf(menuDir, "%s/%s", menuDir, f.fname);
+		}
+
+		romData=menuData;
+		loadListing(menuDir);
+		menuData[menuIndex]=0; //save selection so we can go back there after reset
+
+		xprintf("Done listing for : %s\n", menuDir);
+	} else {													/* It is a file. */
+		xprintf("Adding filename [%s] to path\n", f.fname);
+		xsprintf(buff, "%s/%s", basedir, f.fname);
+
+		romData=c_and_l.cartData;
+		xprintf("Going to read rom image %s\n", buff);
+		loadRom(buff);
 	}
-
-//	xprintf("Adding filename [%s] to path\n", fi.fname);
-	strncat(buff, fi.fname, sizeof(buff)-1);
-
-	f_closedir(&d);
-	romData=cartData;
-	xprintf("Going to read rom image %s\n", buff);
-	loadRom(buff);
 }
 
 //Handle an RPC event
 void doHandleEvent(int data) {
 	// xprintf("Event: %d. arg1: 0x%x\n", data, (int)parmRam[254]);
-	if (data==1) doChangeRom((int)parmRam[254]);
+	if (data==1) doChangeRom(menuDir, (int)parmRam[254]);
 	if (data==2) loadStreamData(0x4000, 1024+512);
 	// xprintf("Event handled. Resuming.\n");
 }
@@ -203,43 +313,25 @@ void doDbgHook(int adr, int data) {
 static FATFS FatFs;
 
 int main(void) {
-//	void (*runptr)(void)=run;
 	void (*runptr)(void)=romemu;
 
-	//Make the STM run at 100MHz
-/* remove warning
-	const clock_scale_t hse_8mhz_3v3_96MHz={
-			.pllm = 8,
-			.plln = 192,
-			.pllp = 2,
-			.pllq = 4,
-			.hpre = RCC_CFGR_HPRE_DIV_NONE,
-			.ppre1 = RCC_CFGR_PPRE_DIV_2,
-			.ppre2 = RCC_CFGR_PPRE_DIV_NONE,
-			.flash_config = FLASH_ACR_ICE | FLASH_ACR_DCE | FLASH_ACR_LATENCY_3WS,
-			.apb1_frequency = 50000000,
-			.apb2_frequency = 100000000,
-		};
-*/
-
-	//...well, actually, we're cheating and running the thing at 120MHz...
 	rcc_clock_setup_hse_3v3(&hse_8mhz_3v3[CLOCK_3V3_120MHZ]);
-//	rcc_clock_setup_hse_3v3(&hse_8mhz_3v3_96MHz);
 	rcc_periph_clock_enable(RCC_GPIOA);
 	rcc_periph_clock_enable(RCC_GPIOB);
 	rcc_periph_clock_enable(RCC_GPIOC);
 	rcc_periph_clock_enable(RCC_USART1);
 	rcc_periph_clock_enable(RCC_SYSCFG);
 
-
+	//Addressable LEDs - output
+	gpio_mode_setup(GPIOB, GPIO_MODE_OUTPUT, GPIO_PUPD_NONE, GPIO13 | GPIO14);
+	// gpio_set_output_options(GPIOB, GPIO_OTYPE_PP, GPIO_OSPEED_2MHZ,  GPIO13 | GPIO14);
 	//LED - output
 	gpio_mode_setup(GPIOB, GPIO_MODE_OUTPUT, GPIO_PUPD_NONE, GPIO0);
 	//USB power - input
 	gpio_mode_setup(GPIOA, GPIO_MODE_INPUT, GPIO_PUPD_PULLDOWN, GPIO9);
 
 	//PB6/PB7: txd/rxd
-	gpio_mode_setup(GPIOB, GPIO_MODE_AF, GPIO_PUPD_NONE,
-			GPIO6 | GPIO7);
+	gpio_mode_setup(GPIOB, GPIO_MODE_AF, GPIO_PUPD_NONE, GPIO6 | GPIO7);
 	gpio_set_af(GPIOB, GPIO_AF7, GPIO6 | GPIO7);
 
 	usart_set_baudrate(USART1, 115200);
@@ -252,30 +344,104 @@ int main(void) {
 	usart_enable(USART1);
 	xdev_out(uart_output_func);
 
-	//Address lines - input
-	gpio_mode_setup(GPIOC, GPIO_MODE_INPUT, GPIO_PUPD_PULLDOWN, 
+	//Address lines - input (A0 - A14 & PB6)
+	gpio_mode_setup(GPIOC, GPIO_MODE_INPUT, GPIO_PUPD_PULLDOWN,
 		GPIO0|GPIO1|GPIO2|GPIO3|GPIO4|GPIO5|GPIO6|GPIO7|GPIO8|GPIO9|GPIO10|GPIO11|GPIO12|GPIO13|GPIO14|GPIO15);
-	gpio_mode_setup(GPIOB, GPIO_MODE_INPUT, GPIO_PUPD_NONE, 
-		GPIO13|GPIO14);
+	// gpio_mode_setup(GPIOB, GPIO_MODE_INPUT, GPIO_PUPD_NONE,
+	// 	GPIO13|GPIO14);
+	// IRQ
+	gpio_mode_setup(GPIOB, GPIO_MODE_INPUT, GPIO_PUPD_NONE, GPIO9);
 
 	//Data lines - output
-	gpio_mode_setup(GPIOA, GPIO_MODE_OUTPUT, GPIO_PUPD_NONE, 
+	gpio_mode_setup(GPIOA, GPIO_MODE_OUTPUT, GPIO_PUPD_NONE,
 		GPIO0|GPIO1|GPIO2|GPIO3|GPIO4|GPIO5|GPIO6|GPIO7);
 
 	//Control lines - input
-	gpio_mode_setup(GPIOB, GPIO_MODE_INPUT, GPIO_PUPD_NONE, 
+	gpio_mode_setup(GPIOB, GPIO_MODE_INPUT, GPIO_PUPD_NONE,
 		GPIO1|GPIO15);
+
+	// SysTick setup (calls sys_tick_handler() every 1ms), also required for delay/millis
+	systick_set_reload(120000);
+	systick_set_clocksource(STK_CSR_CLKSOURCE_AHB);
+	systick_counter_enable();
+	systick_interrupt_enable();
+
 	xprintf("Inited.\n");
+
+	// Test Addressable LEDs
+	// Addressable RGB LEDs
+	uint32_t colors[] = {
+		0,		  // off
+		0xFF0000, // red
+		0xFF9900, // orange
+		0xFFFF00, // yellow
+		0x00FF00, // green
+		0x00FFFF, // cyan
+		0x0000FF, // blue
+		0x7700FF, // pink
+		0xFF00FF, // magenta
+		0xFFFFFF  // white
+	};
+	ledsInitSW(10, GPIOB, GPIO14, GPIOB, GPIO13, RGB_BGR);
+	ledsSetBrightness(150); // be careful not to set this too high when using white, those LEDs draw some power!!
+	uint32_t start = millis();
+	while (millis() - start <= 2000UL) {
+		rainbowCycle(10);
+	}
+
+#if 0 // TEST LED CODE START
+	while (1) {
+		// color wipe back and fourth through the list of colors
+		ledsClear();
+		ledsSetBrightness(150);
+		bool dir = true;
+		for (int x = 1; x < sizeof(colors)/sizeof(*colors); x++) {
+			colorWipe(dir, colors[x], 50);
+			dir = !dir;
+		}
+
+		ledsClear();
+		ledsSetBrightness(255);
+		rainbowCycle(10);
+		rainbowCycle(10);
+
+		ledsClear();
+		knightRider(6, 64, 4, 2, 8, 0xFF7700); // Cycles, Speed, Width, First, Last, RGB Color (original orange-red)
+		knightRider(3, 32, 4, 2, 8, 0xFF00FF); // Cycles, Speed, Width, First, Last, RGB Color (purple)
+		knightRider(3, 32, 4, 2, 8, 0x0000FF); // Cycles, Speed, Width, First, Last, RGB Color (blue)
+		knightRider(3, 32, 5, 2, 8, 0x00FF00); // Cycles, Speed, Width, First, Last, RGB Color (green)
+		knightRider(3, 32, 5, 2, 8, 0xFFFF00); // Cycles, Speed, Width, First, Last, RGB Color (yellow)
+		knightRider(3, 32, 7, 2, 8, 0x00FFFF); // Cycles, Speed, Width, First, Last, RGB Color (cyan)
+		knightRider(3, 32, 7, 2, 8, 0xFFFFFF); // Cycles, Speed, Width, First, Last, RGB Color (white)
+
+		// Iterate through a whole rainbow of colors
+		for(uint8_t j=0; j<252; j+=7) {
+			knightRider(1, 16, 2, 0, 8, colorWheel(j)); // Cycles, Speed, Width, RGB Color
+		}
+
+		ledsClear();
+		ledsSetBrightness(255);
+		int y = 10;
+		for (int x=0; x<10; x++) {
+			theaterChaseRainbow(y);
+			y += 5;
+		}
+	}
+#endif // TEST LED CODE END
 
 	//If USB power pin is high, boot into USB disk mode
 	if (gpio_get(GPIOA, GPIO9)) {
 		xprintf("USB dev mode.\n");
 		ramdiskmain();
 	} else {
+		// disable this or it will delay our ROM emulation!
+		systick_interrupt_disable();
+
 		//Load the menu game
+		strncpy(menuDir, "/roms", sizeof(menuDir));
 		f_mount(&FatFs, "", 0);
 		loadRom("/multicart.bin");
-		loadListing();
+		loadListing(menuDir);
 
 		//Go emulate a ROM.
 		SYSCFG_MEMRMP=0x3; //mak ram at 0
