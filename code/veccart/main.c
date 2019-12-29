@@ -22,7 +22,6 @@
 #include <libopencm3/cm3/systick.h>
 #include <libopencm3/stm32/exti.h>
 #include <libopencm3/cm3/nvic.h>
-#include <libopencm3/stm32/rcc.h>
 #include <libopencm3/stm32/pwr.h>
 #include <libopencm3/stm32/flash.h>
 #include <stdlib.h>
@@ -121,8 +120,30 @@ void loadStreamData(int addr, int len) {
 	f_read(&streamFile, &romData[addr], len, &r);
 }
 
-//User has made a selection in the cart menu (chose the i'th item) so now we have to load
-//the cartridge.
+void doUpDir() {
+  if (strcmp(menuDir, "/roms") != 0)
+    doChangeDir("..");
+}
+
+void doChangeDir(char* dirname) {
+	xprintf("Found directory: %s\n", dirname);
+	if (strcmp(dirname,"..") == 0) {
+		char* ptr = strrchr(menuDir,'/');
+		if (ptr != NULL) {
+			*ptr = '\0';
+		}
+	} else {
+		xsprintf(menuDir, "%s/%s", menuDir, dirname);
+	}
+
+	romData=menuData;
+	loadListing(menuDir, &c_and_l.listing, menuIndex+1 , menuIndex+1+0x200, romData);
+	menuData[menuIndex]=0; //reset selection
+
+	xprintf("Done listing for : %s\n", menuDir);
+}
+
+//User has made a selection in the cart menu (chose the i'th item) so now we have to load the cartridge.
 void doChangeRom(char* basedir, int i) {
 	char buff[300];
 
@@ -132,21 +153,7 @@ void doChangeRom(char* basedir, int i) {
 	file_entry f = c_and_l.listing.f_entry[i];
 
 	if (f.is_dir) {
-		xprintf("Found directory: %s\n", f.fname);
-		if (strcmp(f.fname,"..") == 0) {
-			char* ptr = strrchr(menuDir,'/');
-			if (ptr != NULL) {
-				*ptr = '\0';
-			}
-		} else {
-			xsprintf(menuDir, "%s/%s", menuDir, f.fname);
-		}
-
-		romData=menuData;
-		loadListing(menuDir, &c_and_l.listing, menuIndex+1 , menuIndex+1+0x200, romData);
-		menuData[menuIndex]=0; //save selection so we can go back there after reset
-
-		xprintf("Done listing for : %s\n", menuDir);
+		doChangeDir(f.fname);
 	} else {													/* It is a file. */
 		xprintf("Adding filename [%s] to path\n", f.fname);
 		xsprintf(buff, "%s/%s", basedir, f.fname);
@@ -162,6 +169,7 @@ void doHandleEvent(int data) {
 	// xprintf("Event: %d. arg1: 0x%x\n", data, (int)parmRam[254]);
 	if (data==1) doChangeRom(menuDir, (int)parmRam[254]);
 	if (data==2) loadStreamData(0x4000, 1024+512);
+	if (data==3) doUpDir();
 	// xprintf("Event handled. Resuming.\n");
 }
 
@@ -174,7 +182,24 @@ static FATFS FatFs;
 int main(void) {
 	void (*runptr)(void)=romemu;
 
-	rcc_clock_setup_hse_3v3(&hse_8mhz_3v3[CLOCK_3V3_120MHZ]);
+  const struct rcc_clock_scale hse_8mhz_3v3_120MHz = { /* 120MHz */
+     .pllm = 8,
+     .plln = 240,
+     .pllp = 2,
+     .pllq = 5,
+     .pllr = 0,
+     .pll_source = RCC_CFGR_PLLSRC_HSE_CLK,
+     .hpre = RCC_CFGR_HPRE_DIV_NONE,
+     .ppre1 = RCC_CFGR_PPRE_DIV_4,
+     .ppre2 = RCC_CFGR_PPRE_DIV_2,
+     .voltage_scale = PWR_SCALE1,
+     .flash_config = FLASH_ACR_ICEN | FLASH_ACR_DCEN | FLASH_ACR_LATENCY_3WS,
+     .ahb_frequency  = 120000000,
+     .apb1_frequency = 30000000,
+     .apb2_frequency = 60000000,
+  };
+
+	rcc_clock_setup_pll(&hse_8mhz_3v3_120MHz);
 	rcc_periph_clock_enable(RCC_GPIOA);
 	rcc_periph_clock_enable(RCC_GPIOB);
 	rcc_periph_clock_enable(RCC_GPIOC);
