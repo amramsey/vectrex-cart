@@ -34,14 +34,17 @@ cursor              equ      $c881
 curpos              equ      $c882
 waitjs              equ      $c883
 lastpage            equ      $c884
-header_scale        equ      $c885
-header_dir          equ      $c886
+logo_scale          equ      $c885
+logo_dir            equ      $c886
 page_label          equ      $c887
 page_label_end      equ      $c888
+calibrationValue    equ      $c889
+gameScale           equ      $c890
 ;***************************************************************************
-; VECTREX RAM SECTION ($C800-$CFFF)
+; SYSTEM AREA of USER RAM SECTION ($CB00-$CBEA)
 ;***************************************************************************
 rpcfn               equ      $cb00
+rpcfn2              equ      rpcfn+(rpcfndatend-rpcfndat)
 ;***************************************************************************
 ; HEADER SECTION
 ;***************************************************************************
@@ -56,6 +59,7 @@ rpcfn               equ      $cb00
 ;***************************************************************************
 ; here the cartridge program starts off
 main
+; copy menu RPC function to Vectrex USER RAM
 rpccopystart
                     ldx      #rpcfndat
                     ldy      #rpcfn
@@ -64,33 +68,57 @@ rpccopyloop
                     sta      ,y+
                     cmpx     #rpcfndatend
                     bne      rpccopyloop
+; copy LED RPC function to Vectrex USER RAM
+rpccopystart2
+                    ldx      #rpcfndat2
+                    ldy      #rpcfn2
+rpccopyloop2
+                    lda      ,x+
+                    sta      ,y+
+                    cmpx     #rpcfndatend2
+                    bne      rpccopyloop2
 init_vars
 ; init menu var
                     jsr      init_page_cursor
 ; init vextreme logo vars
                     lda      #1
-                    sta      header_dir
-                    lda      #$5
-                    sta      header_scale
+                    sta      logo_dir
+                    lda      #20
+                    sta      logo_scale
+                    lda      #1
+                    sta      calibrationValue
+                    lda      #1
+                    sta      gameScale
 loop
+; Rainbow Step LEDs
+                    lda      #4                           ; LED step rate
+                    sta      $7ffe                        ; Store in parmRam[254]
+                    lda      #5                           ; rpc call to rainbowStep()
+                    jmp      rpcfn2                       ; Call
+loop_cont
 ; Recal video stuff
                     jsr      Wait_Recal
                     jsr      Intensity_5F
 ; display vextreme logo
-                    ldu      #vextreme_logo               ; address of list
-                    lda      #$7f                         ; Text position relative Y
-                    ldb      #$0                          ; Text position relative X
-                    tfr      d,x                          ; in x position of list
-                    lda      #80                          ; scale positioning
-                    ldb      header_scale                 ; scale move in list
-                    jsr      draw_synced_list
-; header zoom in animation
-                    lda      header_scale
-                    cmpa     #$20
-                    beq      exitHeaderZoom
+drawLogo
+                    ldx      #_SM_vextreme_logo
+nextLogoPart
+                    lda      logo_scale
+                    sta      VIA_t1_cnt_lo
+                    lda      #$CE                          ;Blank low, zero high?
+                    sta      <VIA_cntl
+                    ldu      ,x++
+                    beq      logoDone
+                    jsr      drawSmart
+                    bra      nextLogoPart
+logoDone
+; logo zoom in animation
+                    lda      logo_scale
+                    cmpa     #34
+                    beq      logoZoomDone
                     inca
-                    sta      header_scale
-exitHeaderZoom
+                    sta      logo_scale
+logoZoomDone
 ; menu font settings
                     ldd      #$f160
                     std      Vec_Text_HW
@@ -331,7 +359,7 @@ headerloop
                     cmpx     #$1A
                     bne      headerloop
                     jsr      init_page_cursor
-                    jmp      loop ;start address
+                    jmp      loop_cont ;start address
 newrom
                     ldu      #$f000
                     pshs     u
@@ -339,16 +367,28 @@ newrom
 vextreme_marker
                     fcb      "VEXTREME",$80   ; for matching against cart header
 rpcfndatend
+
+; LED RPC2 function (needed to skip init_page_cursor conditionally)
+rpcfndat2
+                    sta      $7fff
+rpcwaitloop2
+                    lda      $0
+                    cmpa     # 'g'
+                    bne      rpcwaitloop2
+                    lda      $1
+                    cmpa     # ' '
+                    bne      rpcwaitloop2
+                    jmp      loop_cont ;start address
+rpcfndatend2
 ;***************************************************************************
 ; SUBROUTINE SECTION
 ;***************************************************************************
                     include  "printStringSync.asm"
-                    include  "drawSyncList.asm"
 ;***************************************************************************
 ; DATA SECTION
 ;***************************************************************************
                     include  "font_5_fixed.asm"
-                    include  "vextremeLogo.asm"
+                    include  "vextremeLogoSM.asm"
 ; VEXTREME Tune Notes
 CS5                 equ      $1E
 F5                  equ      $22
